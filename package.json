@@ -1,7 +1,7 @@
 {
   "name": "download-manager",
   "productName": "Download Manager",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Download manager that saves each file type directly into its own folder.",
   "main": "main.js",
   "author": "DaRealDante",
