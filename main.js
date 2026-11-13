@@ -1,15 +1,17 @@
 const { app, BrowserWindow, Tray, Menu, ipcMain, dialog, shell, Notification, nativeImage, nativeTheme, clipboard } = require('electron');
 const http = require('http'), fs = require('fs'), path = require('path');
 const { Readable } = require('stream'), { pipeline } = require('stream/promises');
+const Segs = require('./lib/segments');
 const { Bucket, throttle, DEFAULT_CATS, catOf, findRule, migrateRules, parseRuleKey } = require('./lib/util');
 
+app.commandLine.appendSwitch('js-flags', '--max-old-space-size=128');
 const PORT = 48721, MB = 1048576;
 const ICON = path.join(__dirname, 'assets', 'icon.png');
 const R = f => path.join(__dirname, 'renderer', f);
 const DEF = { theme: 'dark', speedMode: 'normal', maxBps: 0, slowPct: 30, downloadDir: '', askNewType: true, askEvery: false,
   onConflict: 'rename', notify: true, openWhenDone: false, startWithWindows: false, toTray: true, keepDays: 0,
   intercept: true, excludedSites: [], minSizeMB: 0 };
-let win, tray, S, saveT, flushT, tickT, quitting = false, upd = { state: 'idle' }, nid = 1, totalSpeed = 0, pq = Promise.resolve();
+let tc = 0, win, tray, S, saveT, flushT, tickT, quitting = false, upd = { state: 'idle' }, nid = 1, totalSpeed = 0, pq = Promise.resolve();
 const dls = new Map(), dirty = new Set(), removed = new Set(), prompts = new Map(), G = new Bucket();
 
 // ---------- storage ----------
@@ -27,7 +29,8 @@ function load() {
   }
 }
 function writeNow() {
-  const downloads = [...dls.values()].slice(-300).map(({ ctl, bucket, _g, speed, ...d }) => d);
+  for (const d of dls.values()) if (d.segs) d.segs.forEach(Segs.sync);
+  const downloads = [...dls.values()].slice(-300).map(({ ctl, bucket, _g, speed, ...d }) => (['done', 'canceled'].includes(d.status) ? { ...d, headers: {} } : d));
   try { fs.writeFileSync(cfgFile(), JSON.stringify({ settings: S.settings, rules: S.rules, cats: S.cats, ignored: S.ignored, downloads })); } catch {}
 }
 const save = () => { clearTimeout(saveT); saveT = setTimeout(writeNow, 1500); };
@@ -78,6 +81,7 @@ function ensureTick() {
     for (const d of dls.values()) if (d.status === 'active') { any = true; d.speed = Math.max(0, d.got - (d._g ?? d.got)); d._g = d.got; sum += d.speed; dirty.add(d.id); }
     const changed = sum !== totalSpeed; totalSpeed = sum;
     if (any || changed) sched(0);
+    if (any && ++tc % 10 === 0) save();
     if (!any) { clearInterval(tickT); tickT = null; }
   }, 1000);
 }
@@ -109,7 +113,7 @@ function prompt(data) {
   return new Promise(resolve => {
     const w = new BrowserWindow({ width: 480, height: data.ext && !data.hasRule ? 440 : 330, useContentSize: true, resizable: false,
       minimizable: false, maximizable: false, autoHideMenuBar: true, alwaysOnTop: true, title: 'New download', icon: ICON, backgroundColor: bg(),
-      webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, sandbox: true } });
+      webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, sandbox: true, spellcheck: false } });
     const id = w.webContents.id;
     prompts.set(id, { data: { ...data, theme: S.settings.theme }, resolve });
     w.on('closed', () => { const p = prompts.get(id); if (p) { prompts.delete(id); p.resolve(null); } });
@@ -139,14 +143,24 @@ function add(url, headers, hint) {
   const d = { id: nid++, url, headers: h, name: nameFromUrl(url), status: 'preparing', size: 0, got: 0, hint: hint || 0, added: Date.now() };
   dls.set(d.id, d); touch(d, 1); prepare(d); return d;
 }
+async function probe(d) {
+  // One tiny request (1 byte) tells us the name, the size and if the server allows parts.
+  const h = { ...d.headers, 'Accept-Encoding': 'identity' };
+  let r = await fetch(d.url, { headers: { ...h, Range: 'bytes=0-0' } });
+  if (!r.ok) { r.body?.cancel().catch(() => {}); r = await fetch(d.url, { headers: h }); }
+  r.body?.cancel().catch(() => {});
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  let total = 0;
+  if (r.status === 206) { const m = /\/(\d+)\s*$/.exec(r.headers.get('content-range') || ''); total = m ? +m[1] : 0; d.ranged = total > 0; }
+  else { total = +r.headers.get('content-length') || 0; d.ranged = false; }
+  d.size = total || d.hint || 0;
+  return r;
+}
 async function prepare(d) {
   d.status = 'preparing'; d.error = '';
   try {
-    const r = await fetch(d.url, { headers: { ...d.headers, 'Accept-Encoding': 'identity' } });
-    r.body?.cancel().catch(() => {});
-    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const r = await probe(d);
     d.name = nameFrom(r, d.url);
-    d.size = +r.headers.get('content-length') || d.hint || 0;
     touch(d, 1);
     const pick = await queue(() => choose(d));
     if (!pick) { d.status = 'canceled'; touch(d, 1); save(); return; }
@@ -156,6 +170,12 @@ async function prepare(d) {
     save(); run(d);
   } catch (e) { d.status = 'error'; d.error = e.message; touch(d, 1); save(); }
 }
+async function moveInto(a, b) { // Windows antivirus can lock a new file for a moment
+  for (let i = 0; ; i++) {
+    try { fs.renameSync(a, b); return; }
+    catch (e) { if (i >= 8 || !['EBUSY', 'EPERM', 'EACCES'].includes(e.code)) throw e; await new Promise(r => setTimeout(r, 150)); }
+  }
+}
 async function run(d) {
   const ctl = new AbortController();
   d.status = 'active'; d.error = ''; d.ctl = ctl; d.bucket = new Bucket();
@@ -163,28 +183,48 @@ async function run(d) {
   touch(d, 1); ensureTick();
   const part = d.path + '.part';
   try {
-    let start = 0; try { start = fs.statSync(part).size; } catch {}
-    const h = { ...d.headers, 'Accept-Encoding': 'identity' }; if (start) h.Range = 'bytes=' + start + '-';
-    const r = await fetch(d.url, { headers: h, signal: ctl.signal });
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    const resumed = start > 0 && r.status === 206; if (!resumed) start = 0;
-    const len = +r.headers.get('content-length') || 0;
-    d.size = len ? len + start : (d.hint || 0); d.got = start; d._g = start;
-    fs.mkdirSync(d.dir, { recursive: true });
-    await pipeline(Readable.fromWeb(r.body), throttle(n => { d.got += n; }, () => [G, d.bucket]),
-      fs.createWriteStream(part, { flags: resumed ? 'a' : 'w', highWaterMark: 262144 }), { signal: ctl.signal });
-    fs.renameSync(part, d.path);
+    if (d.segs || (d.ranged && !d.noRange && d.size >= 4 * MB && !fs.existsSync(part))) {
+      if (!d.segs || !fs.existsSync(part)) {
+        fs.mkdirSync(d.dir, { recursive: true });
+        const fd = fs.openSync(part, 'w'); fs.ftruncateSync(fd, d.size); fs.closeSync(fd);
+        const others = [...dls.values()].filter(x => x !== d && x.status === 'active' && x.segs).length;
+        d.segs = Segs.plan(d.size, Math.floor(16 / (others + 1)));
+      }
+      d.got = Segs.done(d.segs); d._g = d.got;
+      await Segs.run({ url: d.url, headers: d.headers, part, segs: d.segs, signal: ctl.signal, abort: () => ctl.abort(),
+        onBytes: n => { d.got += n; }, buckets: () => [G, d.bucket], onRetry: () => { d.segs.forEach(Segs.sync); d.got = Segs.done(d.segs); } });
+      d.segs = null;
+    } else {
+      let start = 0; try { start = fs.statSync(part).size; } catch {}
+      const h = { ...d.headers, 'Accept-Encoding': 'identity' }; if (start) h.Range = 'bytes=' + start + '-';
+      const r = await fetch(d.url, { headers: h, signal: ctl.signal });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const resumed = start > 0 && r.status === 206; if (!resumed) start = 0;
+      const len = +r.headers.get('content-length') || 0;
+      d.size = len ? len + start : (d.hint || d.size || 0); d.got = start; d._g = start;
+      fs.mkdirSync(d.dir, { recursive: true });
+      await pipeline(Readable.fromWeb(r.body), throttle(n => { d.got += n; }, () => [G, d.bucket]),
+        fs.createWriteStream(part, { flags: resumed ? 'a' : 'w', highWaterMark: 262144 }), { signal: ctl.signal });
+    }
+    await moveInto(part, d.path);
     d.status = 'done'; d.speed = 0; d.done = Date.now(); d.size = d.size || d.got;
     if (S.settings.notify) { const n = new Notification({ title: 'Download complete', body: d.name }); n.on('click', () => shell.showItemInFolder(d.path)); n.show(); }
     if (S.settings.openWhenDone) shell.openPath(d.path);
-  } catch (e) { if (d.status === 'active') { d.status = 'error'; d.error = e.message; d.speed = 0; } }
+  } catch (e) {
+    // The server does not like parts and nothing was saved yet: start again with one connection.
+    if (d.segs && d.status === 'active' && !d.noRange && d.segs.every(s => s.pos === s.s) && ['NORANGE', 'HTTP403', 'HTTP429', 'HTTP503'].includes(e.code)) {
+      d.noRange = true; d.segs = null; try { fs.rmSync(part, { force: true }); } catch {}
+      return run(d);
+    }
+    if (d.status === 'active') { d.status = 'error'; d.error = e.message; d.speed = 0; }
+  }
   if (d.ctl === ctl) { d.ctl = null; d.bucket = null; }
   touch(d, 1); save();
 }
 const act = {
   pause: d => { if (d.status === 'active') { d.status = 'paused'; d.speed = 0; d.ctl?.abort(); } },
   resume: d => { if (['paused', 'error', 'canceled'].includes(d.status)) { if (d.path) run(d); else prepare(d); } },
-  cancel: d => { if (['done', 'canceled'].includes(d.status)) return; d.status = 'canceled'; d.speed = 0; d.ctl?.abort(); if (d.path) setTimeout(() => fs.rm(d.path + '.part', { force: true }, () => {}), 500); },
+  cancel: d => { if (['done', 'canceled'].includes(d.status)) return; d.status = 'canceled'; d.segs = null; d.speed = 0; d.ctl?.abort(); if (d.path) setTimeout(() => fs.rm(d.path + '.part', { force: true }, () => {}), 500); },
   remove: d => { if (d.status === 'active') act.cancel(d); dls.delete(d.id); removed.add(d.id); },
   open: d => { if (d.status === 'done') shell.openPath(d.path); }
 };
@@ -250,7 +290,7 @@ function setupUpdater() {
 // ---------- window, tray ----------
 function mkWin() {
   win = new BrowserWindow({ width: 1060, height: 700, minWidth: 820, minHeight: 560, backgroundColor: bg(), autoHideMenuBar: true, icon: ICON,
-    webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, sandbox: true } });
+    webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, sandbox: true, spellcheck: false } });
   win.loadFile(R('index.html'));
   win.on('closed', () => { win = null; });
 }
@@ -347,7 +387,7 @@ else {
   app.whenReady().then(() => {
     app.setAppUserModelId('com.darealdante.downloadmanager');
     Menu.setApplicationMenu(null);
-    load(); nativeTheme.themeSource = S.settings.theme; applyLimits(); syncExt();
+    load(); nativeTheme.themeSource = S.settings.theme; applyLimits(); setTimeout(syncExt, 3000);
     if (!process.argv.includes('--hidden')) mkWin();
     startServer(); setupUpdater();
     tray = new Tray(nativeImage.createFromPath(ICON).resize({ width: 16, height: 16 }));
