@@ -2,7 +2,7 @@ const { app, BrowserWindow, Tray, Menu, ipcMain, dialog, shell, Notification, na
 const http = require('http'), fs = require('fs'), path = require('path');
 const { Readable } = require('stream'), { pipeline } = require('stream/promises');
 const Segs = require('./lib/segments');
-const { Bucket, throttle, DEFAULT_CATS, catOf, findRule, migrateRules, parseRuleKey } = require('./lib/util');
+const { Bucket, throttle, idleTimeout, DEFAULT_CATS, catOf, findRule, migrateRules, parseRuleKey } = require('./lib/util');
 
 const logErr = e => { try { fs.appendFileSync(path.join(app.getPath('userData'), 'error.log'), new Date().toISOString() + ' ' + ((e && e.stack) || e) + '\n'); } catch {} };
 process.on('uncaughtException', logErr); process.on('unhandledRejection', logErr);
@@ -149,13 +149,18 @@ function add(url, headers, hint) {
   const h = {};
   for (const [k, v] of Object.entries(headers || {})) if (typeof v === 'string') h[k] = v;
   const d = { id: nid++, url, headers: h, name: nameFromUrl(url), status: 'preparing', size: 0, got: 0, hint: hint || 0, added: Date.now() };
-  dls.set(d.id, d); touch(d, 1); prepare(d); return d;
+  dls.set(d.id, d); touch(d, 1); return prepare(d);
 }
 async function probe(d) {
   // One tiny request (1 byte) tells us the name, the size and if the server allows parts.
   const h = { ...d.headers, 'Accept-Encoding': 'identity' };
-  let r = await fetch(d.url, { headers: { ...h, Range: 'bytes=0-0' } });
-  if (!r.ok) { r.body?.cancel().catch(() => {}); r = await fetch(d.url, { headers: h }); }
+  const request = async headers => {
+    const idle = idleTimeout(null, 30000);
+    try { return await fetch(d.url, { headers, signal: idle.signal }); }
+    finally { idle.dispose(); }
+  };
+  let r = await request({ ...h, Range: 'bytes=0-0' });
+  if (!r.ok) { r.body?.cancel().catch(() => {}); r = await request(h); }
   r.body?.cancel().catch(() => {});
   if (!r.ok) throw new Error('HTTP ' + r.status);
   let total = 0;
@@ -171,12 +176,17 @@ async function prepare(d) {
     d.name = nameFrom(r, d.url);
     touch(d, 1);
     const pick = await queue(() => choose(d));
-    if (!pick) { d.status = 'canceled'; touch(d, 1); save(); return; }
+    if (!pick) { d.status = 'canceled'; touch(d, 1); save(); return false; }
     d.dir = pick.dir;
     d.path = S.settings.onConflict === 'overwrite' ? path.join(d.dir, pick.name) : uniq(d.dir, pick.name, d);
     d.name = path.basename(d.path);
-    save(); run(d);
-  } catch (e) { d.status = 'error'; d.error = e.message; touch(d, 1); save(); }
+    save();
+    return await new Promise(resolve => {
+      let settled = false;
+      const ready = ok => { if (!settled) { settled = true; resolve(!!ok); } };
+      run(d, ready);
+    });
+  } catch (e) { d.status = 'error'; d.error = e.message; touch(d, 1); save(); return false; }
 }
 async function moveInto(a, b) { // Windows antivirus can lock a new file for a moment
   for (let i = 0; ; i++) {
@@ -184,7 +194,9 @@ async function moveInto(a, b) { // Windows antivirus can lock a new file for a m
     catch (e) { if (i >= 8 || !['EBUSY', 'EPERM', 'EACCES'].includes(e.code)) throw e; await new Promise(r => setTimeout(r, 150)); }
   }
 }
-async function run(d) {
+async function run(d, onStarted) {
+  let started = false;
+  const markStarted = ok => { if (!started) { started = true; onStarted?.(ok); } };
   const ctl = new AbortController();
   d.status = 'active'; d.error = ''; d.ctl = ctl; d.bucket = new Bucket();
   d.bucket.rate = S.settings.speedMode === 'fast' ? 0 : limitFor(d);
@@ -202,31 +214,38 @@ async function run(d) {
       }
       d.got = Segs.done(d.segs); d._g = d.got;
       await Segs.run({ url: d.url, headers: d.headers, part, segs: d.segs, signal: ctl.signal, abort: () => ctl.abort(),
-        onBytes: n => { d.got += n; }, buckets: () => [G, d.bucket], onRetry: () => { d.segs.forEach(Segs.sync); d.got = Segs.done(d.segs); } });
+        onBytes: n => { d.got += n; if (n) markStarted(true); }, buckets: () => [G, d.bucket], onRetry: () => { d.segs.forEach(Segs.sync); d.got = Segs.done(d.segs); } });
       d.segs = null;
     } else {
       let start = 0; try { start = fs.statSync(part).size; } catch {}
       const h = { ...d.headers, 'Accept-Encoding': 'identity' }; if (start) h.Range = 'bytes=' + start + '-';
-      const r = await fetch(d.url, { headers: h, signal: ctl.signal });
-      if (!r.ok) throw new Error('HTTP ' + r.status);
-      const resumed = start > 0 && r.status === 206; if (!resumed) start = 0;
-      const len = +r.headers.get('content-length') || 0;
-      d.size = len ? len + start : (d.hint || d.size || 0); d.got = start; d._g = start;
-      fs.mkdirSync(d.dir, { recursive: true });
-      await pipeline(Readable.fromWeb(r.body), throttle(n => { d.got += n; }, () => [G, d.bucket]),
-        fs.createWriteStream(part, { flags: resumed ? 'a' : 'w', highWaterMark: 262144 }), { signal: ctl.signal });
+      const idle = idleTimeout(ctl.signal, 45000);
+      try {
+        const r = await fetch(d.url, { headers: h, signal: idle.signal });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const resumed = start > 0 && r.status === 206; if (!resumed) start = 0;
+        const len = +r.headers.get('content-length') || 0;
+        d.size = len ? len + start : (d.hint || d.size || 0); d.got = start; d._g = start;
+        fs.mkdirSync(d.dir, { recursive: true });
+        await pipeline(Readable.fromWeb(r.body), throttle(n => { idle.activity(); d.got += n; if (n) markStarted(true); }, () => [G, d.bucket]),
+          fs.createWriteStream(part, { flags: resumed ? 'a' : 'w', highWaterMark: 262144 }), { signal: idle.signal });
+      } finally { idle.dispose(); }
     }
+    markStarted(true);
     await moveInto(part, d.path);
     d.status = 'done'; d.speed = 0; d.done = Date.now(); d.size = d.size || d.got;
     if (S.settings.notify) { const n = new Notification({ title: 'Download complete', body: d.name }); n.on('click', () => shell.showItemInFolder(d.path)); n.show(); }
     if (S.settings.openWhenDone) shell.openPath(d.path);
   } catch (e) {
-    // The server (or Windows) does not allow parts and nothing was saved yet: start again with one connection.
-    if (segmented && d.status === 'active' && !d.noRange && (!d.segs || d.segs.every(s => s.pos === s.s)) && ['NORANGE', 'HTTP403', 'HTTP429', 'HTTP503', 'EPERM', 'EBUSY', 'EACCES'].includes(e.code)) {
-      d.noRange = true; d.segs = null; try { fs.rmSync(part, { force: true }); } catch {}
-      return run(d);
+    // Some servers accept the initial range probe but reject later ranges (for example, HTTP 416).
+    // If any segmented transfer fails, discard the partial file and retry once with a single connection.
+    if (segmented && d.status === 'active' && !d.noRange) {
+      d.noRange = true; d.segs = null; d.got = 0; d._g = 0;
+      try { fs.rmSync(part, { force: true }); } catch {}
+      return run(d, onStarted);
     }
     if (d.status === 'active') { d.status = 'error'; d.error = e.message; d.speed = 0; }
+    markStarted(false);
   }
   if (d.ctl === ctl) { d.ctl = null; d.bucket = null; }
   touch(d, 1); save();
@@ -265,8 +284,13 @@ function startServer() {
       if (!o.startsWith('chrome-extension://')) return send(403, { ok: false });
       let b = ''; req.on('data', c => { b += c; if (b.length > 65536) req.destroy(); });
       req.on('end', () => {
-        try { const j = JSON.parse(b); if (!/^https?:\/\//i.test(j.url)) throw 0; add(j.url, j.headers, +j.size || 0); send(200, { ok: true }); }
-        catch { send(400, { ok: false }); }
+        try {
+          const j = JSON.parse(b);
+          if (!/^https?:\/\//i.test(j.url)) throw 0;
+          add(j.url, j.headers, +j.size || 0).then(ok => {
+            if (!res.destroyed) send(ok ? 200 : 502, { ok: !!ok });
+          }).catch(() => { if (!res.destroyed) send(502, { ok: false }); });
+        } catch { send(400, { ok: false }); }
       });
       return;
     }
