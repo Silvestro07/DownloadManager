@@ -1,22 +1,56 @@
 {
   "name": "download-manager",
   "productName": "Download Manager",
-  "version": "1.0.5",
-  "description": "Download manager that saves each file type directly into its own folder.",
+  "version": "1.1.3",
+  "description": "Download Manager",
   "main": "main.js",
   "author": "DaRealDante",
   "license": "MIT",
-  "scripts": { "start": "electron .", "dist": "electron-builder --win" },
-  "dependencies": { "electron-updater": "^6.3.9" },
-  "devDependencies": { "electron": "^33.2.0", "electron-builder": "^25.1.8" },
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win"
+  },
+  "dependencies": {
+    "electron-updater": "^6.3.9"
+  },
+  "devDependencies": {
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8"
+  },
   "build": {
     "appId": "com.darealdante.downloadmanager",
     "productName": "Download Manager",
-    "directories": { "output": "dist" },
-    "files": ["main.js", "preload.js", "lib/**", "renderer/**", "assets/**", "package.json"],
-    "extraResources": [{ "from": "extension", "to": "extension" }],
-    "win": { "target": "nsis", "icon": "assets/icon.png" },
-    "nsis": { "oneClick": true, "perMachine": false, "runAfterFinish": true },
-    "publish": { "provider": "github", "owner": "DaRealDante", "repo": "DownloadManager", "releaseType": "release" }
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "lib/**",
+      "renderer/**",
+      "assets/**",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "extension",
+        "to": "extension"
+      }
+    ],
+    "win": {
+      "target": "nsis",
+      "icon": "assets/icon.png"
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "runAfterFinish": true
+    },
+    "publish": {
+      "provider": "github",
+      "owner": "DaRealDante",
+      "repo": "DownloadManager",
+      "releaseType": "release"
+    }
   }
 }

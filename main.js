@@ -4,6 +4,8 @@ const { Readable } = require('stream'), { pipeline } = require('stream/promises'
 const Segs = require('./lib/segments');
 const { Bucket, throttle, DEFAULT_CATS, catOf, findRule, migrateRules, parseRuleKey } = require('./lib/util');
 
+const logErr = e => { try { fs.appendFileSync(path.join(app.getPath('userData'), 'error.log'), new Date().toISOString() + ' ' + ((e && e.stack) || e) + '\n'); } catch {} };
+process.on('uncaughtException', logErr); process.on('unhandledRejection', logErr);
 app.commandLine.appendSwitch('js-flags', '--max-old-space-size=128');
 const PORT = 48721, MB = 1048576;
 const ICON = path.join(__dirname, 'assets', 'icon.png');
@@ -93,19 +95,25 @@ function applyLimits() {
   G.rate = s.speedMode === 'slow' && s.maxBps ? s.maxBps * s.slowPct / 100 : 0;
   for (const d of dls.values()) if (d.bucket) d.bucket.rate = s.speedMode === 'fast' ? 0 : limitFor(d);
 }
-async function measure() {
+const SPEED_URLS = ['https://speed.cloudflare.com/__down?bytes=100000000', 'https://proof.ovh.net/files/100Mb.dat', 'https://speedtest.tele2.net/100MB.zip'];
+async function measureOne(url) {
   const ctl = new AbortController(); let bytes = 0, b1 = 0, t1 = 0;
   const t0 = setTimeout(() => ctl.abort(), 6000);
   const t = setTimeout(() => { b1 = bytes; t1 = Date.now(); }, 1000);
   await Promise.all([1, 2, 3, 4].map(async () => {
     try {
-      const r = await fetch('https://speed.cloudflare.com/__down?bytes=100000000', { signal: ctl.signal, headers: { 'Accept-Encoding': 'identity' } });
+      const r = await fetch(url, { signal: ctl.signal, headers: { 'Accept-Encoding': 'identity' } });
+      if (!r.ok) return;
       for await (const c of Readable.fromWeb(r.body)) bytes += c.length;
     } catch {}
   }));
   clearTimeout(t0); clearTimeout(t);
   if (!t1 || bytes - b1 < 500000) return 0;
   return (bytes - b1) / ((Date.now() - t1) / 1000);
+}
+async function measure() {
+  for (const u of SPEED_URLS) { const v = await measureOne(u); if (v > 0) return v; }
+  return 0;
 }
 
 // ---------- new download: name, folder, popup ----------
@@ -182,11 +190,13 @@ async function run(d) {
   d.bucket.rate = S.settings.speedMode === 'fast' ? 0 : limitFor(d);
   touch(d, 1); ensureTick();
   const part = d.path + '.part';
+  let segmented = false;
   try {
     if (d.segs || (d.ranged && !d.noRange && d.size >= 4 * MB && !fs.existsSync(part))) {
+      segmented = true;
       if (!d.segs || !fs.existsSync(part)) {
         fs.mkdirSync(d.dir, { recursive: true });
-        const fd = fs.openSync(part, 'w'); fs.ftruncateSync(fd, d.size); fs.closeSync(fd);
+        await Segs.prealloc(part, d.size);
         const others = [...dls.values()].filter(x => x !== d && x.status === 'active' && x.segs).length;
         d.segs = Segs.plan(d.size, Math.floor(16 / (others + 1)));
       }
@@ -211,8 +221,8 @@ async function run(d) {
     if (S.settings.notify) { const n = new Notification({ title: 'Download complete', body: d.name }); n.on('click', () => shell.showItemInFolder(d.path)); n.show(); }
     if (S.settings.openWhenDone) shell.openPath(d.path);
   } catch (e) {
-    // The server does not like parts and nothing was saved yet: start again with one connection.
-    if (d.segs && d.status === 'active' && !d.noRange && d.segs.every(s => s.pos === s.s) && ['NORANGE', 'HTTP403', 'HTTP429', 'HTTP503'].includes(e.code)) {
+    // The server (or Windows) does not allow parts and nothing was saved yet: start again with one connection.
+    if (segmented && d.status === 'active' && !d.noRange && (!d.segs || d.segs.every(s => s.pos === s.s)) && ['NORANGE', 'HTTP403', 'HTTP429', 'HTTP503', 'EPERM', 'EBUSY', 'EACCES'].includes(e.code)) {
       d.noRange = true; d.segs = null; try { fs.rmSync(part, { force: true }); } catch {}
       return run(d);
     }
@@ -348,7 +358,7 @@ ipcMain.handle('cat:save', (e, name, text) => {
 ipcMain.handle('cat:del', (e, name) => { delete S.cats[name]; S.rules = S.rules.filter(r => !(r.kind === 'cat' && r.key === name)); applyLimits(); save(); });
 ipcMain.handle('ignored:clear', () => { S.ignored = []; S.settings.askNewType = true; save(); });
 ipcMain.handle('ext:open', () => shell.openPath(extDir()));
-ipcMain.handle('speed:test', async () => { const v = await measure(); if (v > 0) { S.settings.maxBps = Math.round(v); applyLimits(); save(); } return S.settings.maxBps; });
+ipcMain.handle('speed:test', async () => { const v = await measure(); if (v > 0) { S.settings.maxBps = Math.round(v); applyLimits(); save(); } return Math.round(v); });
 ipcMain.handle('update:check', () => { if (autoUpdater) autoUpdater.checkForUpdates().catch(() => {}); else { upd = { state: 'error' }; sendFull(); } });
 ipcMain.handle('update:install', () => { quitting = true; autoUpdater && autoUpdater.quitAndInstall(); });
 ipcMain.handle('prompt:init', e => prompts.get(e.sender.id)?.data);

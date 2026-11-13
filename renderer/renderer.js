@@ -4,6 +4,7 @@ const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': 
 const MB = 1048576;
 const fmt = n => { if (!n || n < 0) return '0 B'; const u = ['B', 'KB', 'MB', 'GB', 'TB']; const i = Math.min(4, Math.floor(Math.log(n) / Math.log(1024))); return (n / 1024 ** i).toFixed(i > 1 ? 1 : 0) + ' ' + u[i]; };
 const spd = n => fmt(n) + '/s';
+const mbps = n => Math.round(n * 8 / 1e6) + ' Mbps';
 const eta = s => { if (!isFinite(s) || s <= 0) return ''; s = Math.round(s); return (s >= 3600 ? Math.floor(s / 3600) + ' h ' + Math.floor(s % 3600 / 60) + ' min' : s >= 60 ? Math.floor(s / 60) + ' min ' + s % 60 + ' s' : s + ' s') + ' left'; };
 const when = d => new Date(d.done || d.added).toLocaleString([], { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
 const I = {
@@ -198,7 +199,7 @@ const PANES = {
   speed: () => {
     const s = S.settings;
     return `<div class="modes">${MODES.map(m => `<button class="mode ${s.speedMode === m.k ? 'on ' + m.k : ''}" data-mode="${m.k}">${ic(m.i, 26)}<b>${m.n}</b><small>${esc(m.d(s))}</small></button>`).join('')}</div>` +
-      row('Maximum speed', s.maxBps ? `Measured one time: ${spd(s.maxBps)}. Slow mode uses a share of this value.` : 'Not measured yet. The app measures it one time after the first start.',
+      row('Maximum speed', s.maxBps ? `Measured one time: ${spd(s.maxBps)} (${mbps(s.maxBps)}). Slow mode uses a share of this value.` : 'Not measured yet. The app measures it one time after the first start.',
         `<input type="number" step="0.1" min="0" style="width:90px" data-set="maxBps" data-mult="${MB}" value="${s.maxBps ? (s.maxBps / MB).toFixed(1) : ''}" placeholder="MB/s" aria-label="Maximum speed in MB/s"><button class="btn" data-a="measure">Measure now</button>`) +
       row('Slow mode share', 'Percent of your maximum speed used in slow mode.', `<input type="range" min="5" max="95" step="5" data-set="slowPct" value="${s.slowPct}" aria-label="Slow mode share"><span id="sp">${s.slowPct}%</span>`);
   },
@@ -282,7 +283,7 @@ document.addEventListener('click', async e => {
   else if (a === 'ext') api.invoke('ext:open');
   else if (a === 'upd-check') api.invoke('update:check');
   else if (a === 'upd-install') api.invoke('update:install');
-  else if (a === 'measure') { t.disabled = true; t.textContent = 'Measuring…'; await api.invoke('speed:test'); await reload(); pane(); toast('Maximum speed updated'); }
+  else if (a === 'measure') { t.disabled = true; t.textContent = 'Measuring, about 10 s…'; const v = await api.invoke('speed:test'); await reload(); pane(); toast(v ? `Your maximum speed: ${spd(v)} (${mbps(v)})` : 'Could not measure. Check your internet and try again.'); }
   else if (a === 'rule-add') ruleModal();
   else if (a === 'rule-edit') ruleModal(S.rules.find(r => r.id === d.id));
   else if (a === 'rule-del') { await api.invoke('rule:del', d.id); await reload(); pane(); }
