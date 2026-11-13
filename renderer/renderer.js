@@ -37,7 +37,7 @@ const capBps = () => S.settings.speedMode === 'slow' && S.settings.maxBps ? S.se
 
 // ---------- shell ----------
 function build() {
-  const rb = (k, l, i) => `<button class="rb" data-nav="${k}">${ic(i, 22)}<span>${l}</span></button>`;
+  const rb = (k, l, i) => `<button class="rb" data-nav="${k}"><i class="ri">${ic(i, 22)}</i><span>${l}</span></button>`;
   $('#app').innerHTML = `<nav class="rail"><div class="logo">${ic('download', 22)}</div>${rb('downloads', 'Downloads', 'download')}${rb('settings', 'Settings', 'settings')}<div class="ver">v${esc(S.version)}</div></nav><main id="view"></main>`;
   show();
 }
@@ -50,11 +50,11 @@ function buildDownloads() {
   const s = S.settings;
   const cats = ['all', ...Object.keys(S.cats), 'Other'];
   $('#view').innerHTML = `<header class="top"><h1>Downloads</h1><div class="grow"></div>
-    <button class="btn" data-a="clear">Clear finished</button><button class="btn" data-a="add">${ic('plus')}Add link</button>
+    <button class="btn ghost" data-a="clear">Clear finished</button><button class="btn" data-a="add">${ic('plus')}Add link</button>
     <div class="seg" role="group" aria-label="Speed mode">${MODES.map(m => `<button data-mode="${m.k}" class="${s.speedMode === m.k ? 'on ' + m.k : ''}" title="${esc(m.t(s))}" aria-label="${esc(m.t(s))}">${ic(m.i, 20)}</button>`).join('')}</div></header>
     <section class="hero"><div class="hl"><div class="big" id="spd"></div><div class="cap" id="cap"></div><div id="sts"></div></div><canvas id="gr"></canvas></section>
     <div class="tools"><div class="search">${ic('search', 16)}<input id="q" type="text" placeholder="Search downloads" aria-label="Search downloads" value="${esc(F.q)}"></div>
-      <div class="tabs">${[['all', 'All'], ['run', 'In progress'], ['done', 'Completed'], ['fail', 'Failed']].map(([k, l]) => `<button data-t="${k}" class="${F.status === k ? 'on' : ''}">${l} <b>0</b></button>`).join('')}</div>
+      <div class="tabs">${[['all', 'All'], ['run', 'Active'], ['done', 'Done'], ['fail', 'Failed']].map(([k, l]) => `<button data-t="${k}" class="${F.status === k ? 'on' : ''}">${l} <b>0</b></button>`).join('')}</div>
       <select id="fcat" aria-label="Category">${cats.map(c => `<option value="${esc(c)}" ${F.cat === c ? 'selected' : ''}>${c === 'all' ? 'All types' : esc(c)}</option>`).join('')}</select>
       <select id="fdate" aria-label="Date">${[['any', 'Any date'], ['today', 'Today'], ['7d', 'Last 7 days'], ['30d', 'Last 30 days'], ['pick', 'Pick a day']].map(([v, l]) => `<option value="${v}" ${F.date === v ? 'selected' : ''}>${l}</option>`).join('')}</select>
       <input type="date" id="fday" value="${esc(F.day)}" ${F.date === 'pick' ? '' : 'hidden'}>
@@ -156,8 +156,12 @@ function drawGraph() {
   const css = getComputedStyle(document.documentElement), ac = css.getPropertyValue('--ac').trim(), mu = css.getPropertyValue('--mu').trim();
   const cap = capBps(), max = Math.max(...hist, cap, MB) * 1.2;
   const Y = v => h - 8 - v / max * (h - 22), P = hist.map((v, i) => [i / (hist.length - 1) * w, Y(v)]);
-  x.beginPath(); P.forEach(([px, py], i) => i ? x.lineTo(px, py) : x.moveTo(px, py));
-  x.strokeStyle = ac; x.lineWidth = 2; x.lineJoin = 'round'; x.stroke();
+  const ln = css.getPropertyValue('--ln').trim();
+  x.strokeStyle = ln; x.lineWidth = 1; for (let k = 1; k < 4; k++) { const y = Math.round(h * k / 4) + .5; x.beginPath(); x.moveTo(0, y); x.lineTo(w, y); x.stroke(); }
+  x.beginPath(); x.moveTo(P[0][0], P[0][1]);
+  for (let i = 1; i < P.length - 1; i++) x.quadraticCurveTo(P[i][0], P[i][1], (P[i][0] + P[i + 1][0]) / 2, (P[i][1] + P[i + 1][1]) / 2);
+  x.lineTo(P[P.length - 1][0], P[P.length - 1][1]);
+  x.strokeStyle = ac; x.lineWidth = 2.5; x.lineJoin = 'round'; x.lineCap = 'round'; x.stroke();
   x.lineTo(w, h); x.lineTo(0, h); x.closePath();
   const g = x.createLinearGradient(0, 0, 0, h); g.addColorStop(0, ac + '55'); g.addColorStop(1, ac + '00'); x.fillStyle = g; x.fill();
   if (cap) { const y = Y(cap); x.setLineDash([5, 5]); x.strokeStyle = mu; x.lineWidth = 1; x.beginPath(); x.moveTo(0, y); x.lineTo(w, y); x.stroke(); x.setLineDash([]); x.fillStyle = mu; x.font = '11px sans-serif'; x.fillText('limit', w - 34, y - 4); }

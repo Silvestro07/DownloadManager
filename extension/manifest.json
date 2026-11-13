@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Download Manager Connector",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "description": "Sends Chrome downloads to the Download Manager app.",
   "permissions": ["downloads", "cookies"],
   "host_permissions": ["<all_urls>"],
