@@ -11,11 +11,13 @@ chrome.downloads.onCreated.addListener(async item => {
     const host = new URL(url).hostname;
     const st = await api('/ping'); // fails if the app is closed: Chrome keeps the download
     if (!st.intercept || (st.exclude || []).some(s => host === s || host.endsWith('.' + s))) return;
+    const size = item.totalBytes > 0 ? item.totalBytes : 0;
+    if (st.minSize && size > 0 && size < st.minSize) return;
     const headers = { 'User-Agent': navigator.userAgent };
     if (item.referrer) headers.Referer = item.referrer;
     const cookies = await chrome.cookies.getAll({ url });
     if (cookies.length) headers.Cookie = cookies.map(c => c.name + '=' + c.value).join('; ');
-    const r = await api('/download', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url, headers }) });
+    const r = await api('/download', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url, headers, size }) });
     if (r.ok) { await chrome.downloads.cancel(item.id); await chrome.downloads.erase({ id: item.id }); }
   } catch (e) {}
 });

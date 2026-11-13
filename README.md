@@ -10,6 +10,9 @@ Windows download manager. Each file type goes straight into its own folder. Noth
 The app updates itself from GitHub Releases.
 
 ## Publish a new version
+Double-click `publish.bat`. It uploads the files and can create the new version for you.
+
+Manual way:
 1. Change `version` in `package.json` (example: `1.0.1`).
 2. Commit, then run: `git tag v1.0.1` and `git push --tags`.
 3. GitHub Actions builds the setup file and adds it to Releases.

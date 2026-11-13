@@ -1,7 +1,8 @@
 const { contextBridge, ipcRenderer } = require('electron');
-const OK = ['state', 'dl', 'add', 'set', 'rule:set', 'rule:del', 'ignored:clear', 'pick', 'ext:open', 'update:check', 'update:install'];
+const INV = ['state', 'dl', 'dl:menu', 'dl:rename', 'dl:clear', 'add', 'set', 'rule:save', 'rule:del', 'cat:save', 'cat:del',
+  'ignored:clear', 'pick', 'clip', 'ext:open', 'speed:test', 'update:check', 'update:install', 'prompt:init', 'prompt:done'];
+const EV = ['patch', 'full', 'rename', 'toast'];
 contextBridge.exposeInMainWorld('api', {
-  onState: f => ipcRenderer.on('state', (e, s) => f(s)),
-  state: () => ipcRenderer.invoke('state'),
-  invoke: (ch, ...a) => { if (!OK.includes(ch)) throw new Error('blocked'); return ipcRenderer.invoke(ch, ...a); }
+  on: (ch, f) => { if (EV.includes(ch)) ipcRenderer.on(ch, (e, ...a) => f(...a)); },
+  invoke: (ch, ...a) => { if (!INV.includes(ch)) throw new Error('blocked'); return ipcRenderer.invoke(ch, ...a); }
 });

@@ -1,7 +1,7 @@
 {
   "name": "download-manager",
   "productName": "Download Manager",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "Download manager that saves each file type directly into its own folder.",
   "main": "main.js",
   "author": "DaRealDante",
@@ -13,7 +13,7 @@
     "appId": "com.darealdante.downloadmanager",
     "productName": "Download Manager",
     "directories": { "output": "dist" },
-    "files": ["main.js", "preload.js", "renderer/**", "assets/**", "package.json"],
+    "files": ["main.js", "preload.js", "lib/**", "renderer/**", "assets/**", "package.json"],
     "extraResources": [{ "from": "extension", "to": "extension" }],
     "win": { "target": "nsis", "icon": "assets/icon.png" },
     "nsis": { "oneClick": true, "perMachine": false, "runAfterFinish": true },
