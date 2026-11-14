@@ -188,6 +188,7 @@ const PANES = {
   general: () => row('Theme', 'Dark, light, or the same as Windows.', selc('theme', [['dark', 'Dark'], ['light', 'Light'], ['system', 'Follow Windows']])) +
     row('Start with Windows', 'Starts hidden in the tray.', tg('startWithWindows')) +
     row('Keep running in the tray when closed', 'Closing the window frees memory. Downloads continue.', tg('toTray')) +
+    row('Notify when a download starts', 'Windows notification with the file name.', tg('notifyStart')) +
     row('Notify when a download finishes', 'Click the notification to show the file.', tg('notify')) +
     row('Open the file when finished', 'Opens each file after it downloads.', tg('openWhenDone')) +
     row('Clear finished downloads from the list', 'Files on disk are never deleted.', selc('keepDays', [[0, 'Never'], [1, 'After 1 day'], [7, 'After 7 days'], [30, 'After 30 days']])),
@@ -201,7 +202,8 @@ const PANES = {
     return `<div class="modes">${MODES.map(m => `<button class="mode ${s.speedMode === m.k ? 'on ' + m.k : ''}" data-mode="${m.k}">${ic(m.i, 26)}<b>${m.n}</b><small>${esc(m.d(s))}</small></button>`).join('')}</div>` +
       row('Maximum speed', s.maxBps ? `Measured one time: ${spd(s.maxBps)} (${mbps(s.maxBps)}). Slow mode uses a share of this value.` : 'Not measured yet. The app measures it one time after the first start.',
         `<input type="number" step="0.1" min="0" style="width:90px" data-set="maxBps" data-mult="${MB}" value="${s.maxBps ? (s.maxBps / MB).toFixed(1) : ''}" placeholder="MB/s" aria-label="Maximum speed in MB/s"><button class="btn" data-a="measure">Measure now</button>`) +
-      row('Slow mode share', 'Percent of your maximum speed used in slow mode.', `<input type="range" min="5" max="95" step="5" data-set="slowPct" value="${s.slowPct}" aria-label="Slow mode share"><span id="sp">${s.slowPct}%</span>`);
+      row('Slow mode share', 'Percent of your maximum speed used in slow mode.', `<input type="range" min="5" max="95" step="5" data-set="slowPct" value="${s.slowPct}" aria-label="Slow mode share"><span id="sp">${s.slowPct}%</span>`) +
+      row('Multi-part downloads', 'Splits big files into parts, which is faster on some servers. Keep it off for file sites with one-time links.', tg('multiPart'));
   },
   types: () => {
     const rules = S.rules.map(r => {

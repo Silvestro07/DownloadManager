@@ -2,7 +2,7 @@ const { app, BrowserWindow, Tray, Menu, ipcMain, dialog, shell, Notification, na
 const http = require('http'), fs = require('fs'), path = require('path');
 const { Readable } = require('stream'), { pipeline } = require('stream/promises');
 const Segs = require('./lib/segments');
-const { Bucket, throttle, idleTimeout, DEFAULT_CATS, catOf, findRule, migrateRules, parseRuleKey } = require('./lib/util');
+const { Bucket, throttle, DEFAULT_CATS, catOf, findRule, migrateRules, parseRuleKey } = require('./lib/util');
 
 const logErr = e => { try { fs.appendFileSync(path.join(app.getPath('userData'), 'error.log'), new Date().toISOString() + ' ' + ((e && e.stack) || e) + '\n'); } catch {} };
 process.on('uncaughtException', logErr); process.on('unhandledRejection', logErr);
@@ -11,7 +11,7 @@ const PORT = 48721, MB = 1048576;
 const ICON = path.join(__dirname, 'assets', 'icon.png');
 const R = f => path.join(__dirname, 'renderer', f);
 const DEF = { theme: 'dark', speedMode: 'normal', maxBps: 0, slowPct: 30, downloadDir: '', askNewType: true, askEvery: false,
-  onConflict: 'rename', notify: true, openWhenDone: false, startWithWindows: false, toTray: true, keepDays: 0,
+  onConflict: 'rename', notify: true, notifyStart: true, multiPart: false, openWhenDone: false, startWithWindows: false, toTray: true, keepDays: 0,
   intercept: true, excludedSites: [], minSizeMB: 0 };
 let tc = 0, win, tray, S, saveT, flushT, tickT, quitting = false, upd = { state: 'idle' }, nid = 1, totalSpeed = 0, pq = Promise.resolve();
 const dls = new Map(), dirty = new Set(), removed = new Set(), prompts = new Map(), G = new Bucket();
@@ -32,7 +32,7 @@ function load() {
 }
 function writeNow() {
   for (const d of dls.values()) if (d.segs) d.segs.forEach(Segs.sync);
-  const downloads = [...dls.values()].slice(-300).map(({ ctl, bucket, _g, speed, ...d }) => (['done', 'canceled'].includes(d.status) ? { ...d, headers: {} } : d));
+  const downloads = [...dls.values()].slice(-300).map(({ ctl, bucket, _g, speed, first, ...d }) => (['done', 'canceled'].includes(d.status) ? { ...d, headers: {} } : d));
   try { fs.writeFileSync(cfgFile(), JSON.stringify({ settings: S.settings, rules: S.rules, cats: S.cats, ignored: S.ignored, downloads })); } catch {}
 }
 const save = () => { clearTimeout(saveT); saveT = setTimeout(writeNow, 1500); };
@@ -80,7 +80,11 @@ function ensureTick() {
   if (tickT) return;
   tickT = setInterval(() => {
     let sum = 0, any = false;
-    for (const d of dls.values()) if (d.status === 'active') { any = true; d.speed = Math.max(0, d.got - (d._g ?? d.got)); d._g = d.got; sum += d.speed; dirty.add(d.id); }
+    for (const d of dls.values()) if (d.status === 'active') {
+      any = true; d.speed = Math.max(0, d.got - (d._g ?? d.got)); d._g = d.got; sum += d.speed; dirty.add(d.id);
+      if (d.got === d._p) d._idle = (d._idle || 0) + 1; else { d._idle = 0; d._p = d.got; }
+      if (d._idle >= 45) { d.status = 'error'; d.error = 'No data for 45 seconds. Press retry.'; d.speed = 0; d.ctl?.abort(); }
+    }
     const changed = sum !== totalSpeed; totalSpeed = sum;
     if (any || changed) sched(0);
     if (any && ++tc % 10 === 0) save();
@@ -149,44 +153,34 @@ function add(url, headers, hint) {
   const h = {};
   for (const [k, v] of Object.entries(headers || {})) if (typeof v === 'string') h[k] = v;
   const d = { id: nid++, url, headers: h, name: nameFromUrl(url), status: 'preparing', size: 0, got: 0, hint: hint || 0, added: Date.now() };
-  dls.set(d.id, d); touch(d, 1); return prepare(d);
-}
-async function probe(d) {
-  // One tiny request (1 byte) tells us the name, the size and if the server allows parts.
-  const h = { ...d.headers, 'Accept-Encoding': 'identity' };
-  const request = async headers => {
-    const idle = idleTimeout(null, 30000);
-    try { return await fetch(d.url, { headers, signal: idle.signal }); }
-    finally { idle.dispose(); }
-  };
-  let r = await request({ ...h, Range: 'bytes=0-0' });
-  if (!r.ok) { r.body?.cancel().catch(() => {}); r = await request(h); }
-  r.body?.cancel().catch(() => {});
-  if (!r.ok) throw new Error('HTTP ' + r.status);
-  let total = 0;
-  if (r.status === 206) { const m = /\/(\d+)\s*$/.exec(r.headers.get('content-range') || ''); total = m ? +m[1] : 0; d.ranged = total > 0; }
-  else { total = +r.headers.get('content-length') || 0; d.ranged = false; }
-  d.size = total || d.hint || 0;
-  return r;
+  dls.set(d.id, d); touch(d, 1); prepare(d); return d;
 }
 async function prepare(d) {
   d.status = 'preparing'; d.error = '';
   try {
-    const r = await probe(d);
+    // One normal request. Its answer gives the name and size, and later it is also the download itself.
+    // File sites with one-time links break if the file is asked for two times.
+    const r = await fetch(d.url, { headers: { ...d.headers, 'Accept-Encoding': 'identity' } });
+    if (!r.ok) { r.body?.cancel().catch(() => {}); throw new Error('HTTP ' + r.status); }
+    const enc = (r.headers.get('content-encoding') || '').replace(/identity/i, '');
+    const len = enc ? 0 : +r.headers.get('content-length') || 0;
     d.name = nameFrom(r, d.url);
-    touch(d, 1);
+    d.size = len || (enc ? 0 : d.hint) || 0;
+    d.ranged = len > 0 && /bytes/i.test(r.headers.get('accept-ranges') || '') && !r.headers.get('content-encoding');
+    d.first = r; touch(d, 1);
+    const t0 = Date.now();
     const pick = await queue(() => choose(d));
-    if (!pick) { d.status = 'canceled'; touch(d, 1); save(); return false; }
+    if (!pick || d.status !== 'preparing') {
+      d.first?.body?.cancel().catch(() => {}); d.first = null;
+      if (!pick) { d.status = 'canceled'; touch(d, 1); save(); }
+      return;
+    }
+    if (d.first && Date.now() - t0 > 15000) { d.first.body?.cancel().catch(() => {}); d.first = null; } // the server may close a waiting connection
     d.dir = pick.dir;
     d.path = S.settings.onConflict === 'overwrite' ? path.join(d.dir, pick.name) : uniq(d.dir, pick.name, d);
     d.name = path.basename(d.path);
-    save();
-    return await new Promise(resolve => {
-      let settled = false;
-      const ready = ok => { if (!settled) { settled = true; resolve(!!ok); } };
-      run(d, ready);
-    });
-  } catch (e) { d.status = 'error'; d.error = e.message; touch(d, 1); save(); return false; }
+    save(); run(d);
+  } catch (e) { d.first?.body?.cancel().catch(() => {}); d.first = null; d.status = 'error'; d.error = e.message; touch(d, 1); save(); }
 }
 async function moveInto(a, b) { // Windows antivirus can lock a new file for a moment
   for (let i = 0; ; i++) {
@@ -194,18 +188,20 @@ async function moveInto(a, b) { // Windows antivirus can lock a new file for a m
     catch (e) { if (i >= 8 || !['EBUSY', 'EPERM', 'EACCES'].includes(e.code)) throw e; await new Promise(r => setTimeout(r, 150)); }
   }
 }
-async function run(d, onStarted) {
-  let started = false;
-  const markStarted = ok => { if (!started) { started = true; onStarted?.(ok); } };
+async function run(d) {
   const ctl = new AbortController();
   d.status = 'active'; d.error = ''; d.ctl = ctl; d.bucket = new Bucket();
   d.bucket.rate = S.settings.speedMode === 'fast' ? 0 : limitFor(d);
   touch(d, 1); ensureTick();
+  d._idle = 0; d._p = -1;
+  if (S.settings.notifyStart && !d.notified) { d.notified = true; try { new Notification({ title: 'Download started', body: d.name }).show(); } catch {} }
   const part = d.path + '.part';
   let segmented = false;
   try {
-    if (d.segs || (d.ranged && !d.noRange && d.size >= 4 * MB && !fs.existsSync(part))) {
+    if (d.segs && !S.settings.multiPart && d.segs.every(s => s.pos === s.s)) { d.segs = null; try { fs.rmSync(part, { force: true }); } catch {} }
+    if (d.segs || (S.settings.multiPart && d.ranged && !d.noRange && d.size >= 8 * MB && !fs.existsSync(part))) {
       segmented = true;
+      if (d.first) { d.first.body?.cancel().catch(() => {}); d.first = null; }
       if (!d.segs || !fs.existsSync(part)) {
         fs.mkdirSync(d.dir, { recursive: true });
         await Segs.prealloc(part, d.size);
@@ -214,38 +210,38 @@ async function run(d, onStarted) {
       }
       d.got = Segs.done(d.segs); d._g = d.got;
       await Segs.run({ url: d.url, headers: d.headers, part, segs: d.segs, signal: ctl.signal, abort: () => ctl.abort(),
-        onBytes: n => { d.got += n; if (n) markStarted(true); }, buckets: () => [G, d.bucket], onRetry: () => { d.segs.forEach(Segs.sync); d.got = Segs.done(d.segs); } });
+        onBytes: n => { d.got += n; }, buckets: () => [G, d.bucket], onRetry: () => { d.segs.forEach(Segs.sync); d.got = Segs.done(d.segs); } });
       d.segs = null;
     } else {
       let start = 0; try { start = fs.statSync(part).size; } catch {}
-      const h = { ...d.headers, 'Accept-Encoding': 'identity' }; if (start) h.Range = 'bytes=' + start + '-';
-      const idle = idleTimeout(ctl.signal, 45000);
-      try {
-        const r = await fetch(d.url, { headers: h, signal: idle.signal });
-        if (!r.ok) throw new Error('HTTP ' + r.status);
-        const resumed = start > 0 && r.status === 206; if (!resumed) start = 0;
-        const len = +r.headers.get('content-length') || 0;
-        d.size = len ? len + start : (d.hint || d.size || 0); d.got = start; d._g = start;
-        fs.mkdirSync(d.dir, { recursive: true });
-        await pipeline(Readable.fromWeb(r.body), throttle(n => { idle.activity(); d.got += n; if (n) markStarted(true); }, () => [G, d.bucket]),
-          fs.createWriteStream(part, { flags: resumed ? 'a' : 'w', highWaterMark: 262144 }), { signal: idle.signal });
-      } finally { idle.dispose(); }
+      if (d.size && start >= d.size) { try { fs.rmSync(part, { force: true }); } catch {} start = 0; }
+      let r = d.first; d.first = null; // the first answer of the server is used, so only one request is needed
+      if (r && start > 0) { r.body?.cancel().catch(() => {}); r = null; }
+      if (!r) {
+        const h = { ...d.headers, 'Accept-Encoding': 'identity' }; if (start) h.Range = 'bytes=' + start + '-';
+        r = await fetch(d.url, { headers: h, signal: ctl.signal });
+      }
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const resumed = start > 0 && r.status === 206; if (!resumed) start = 0;
+      const enc = (r.headers.get('content-encoding') || '').replace(/identity/i, '');
+      const len = enc ? 0 : +r.headers.get('content-length') || 0;
+      d.size = len ? len + start : (enc ? 0 : (d.hint || d.size || 0)); d.got = start; d._g = start;
+      fs.mkdirSync(d.dir, { recursive: true });
+      await pipeline(Readable.fromWeb(r.body), throttle(n => { d.got += n; }, () => [G, d.bucket]),
+        fs.createWriteStream(part, { flags: resumed ? 'a' : 'w', highWaterMark: 262144 }), { signal: ctl.signal });
     }
-    markStarted(true);
+    if (S.settings.onConflict !== 'overwrite' && fs.existsSync(d.path)) { d.path = uniq(d.dir, d.name, d); d.name = path.basename(d.path); }
     await moveInto(part, d.path);
     d.status = 'done'; d.speed = 0; d.done = Date.now(); d.size = d.size || d.got;
     if (S.settings.notify) { const n = new Notification({ title: 'Download complete', body: d.name }); n.on('click', () => shell.showItemInFolder(d.path)); n.show(); }
     if (S.settings.openWhenDone) shell.openPath(d.path);
   } catch (e) {
-    // Some servers accept the initial range probe but reject later ranges (for example, HTTP 416).
-    // If any segmented transfer fails, discard the partial file and retry once with a single connection.
-    if (segmented && d.status === 'active' && !d.noRange) {
-      d.noRange = true; d.segs = null; d.got = 0; d._g = 0;
-      try { fs.rmSync(part, { force: true }); } catch {}
-      return run(d, onStarted);
+    // The server (or Windows) does not allow parts and nothing was saved yet: start again with one connection.
+    if (segmented && d.status === 'active' && !d.noRange && (!d.segs || d.segs.every(s => s.pos === s.s)) && ['NORANGE', 'HTTP403', 'HTTP429', 'HTTP503', 'EPERM', 'EBUSY', 'EACCES'].includes(e.code)) {
+      d.noRange = true; d.segs = null; try { fs.rmSync(part, { force: true }); } catch {}
+      return run(d);
     }
     if (d.status === 'active') { d.status = 'error'; d.error = e.message; d.speed = 0; }
-    markStarted(false);
   }
   if (d.ctl === ctl) { d.ctl = null; d.bucket = null; }
   touch(d, 1); save();
@@ -253,8 +249,8 @@ async function run(d, onStarted) {
 const act = {
   pause: d => { if (d.status === 'active') { d.status = 'paused'; d.speed = 0; d.ctl?.abort(); } },
   resume: d => { if (['paused', 'error', 'canceled'].includes(d.status)) { if (d.path) run(d); else prepare(d); } },
-  cancel: d => { if (['done', 'canceled'].includes(d.status)) return; d.status = 'canceled'; d.segs = null; d.speed = 0; d.ctl?.abort(); if (d.path) setTimeout(() => fs.rm(d.path + '.part', { force: true }, () => {}), 500); },
-  remove: d => { if (d.status === 'active') act.cancel(d); dls.delete(d.id); removed.add(d.id); },
+  cancel: d => { if (['done', 'canceled'].includes(d.status)) return; d.status = 'canceled'; d.segs = null; d.first?.body?.cancel().catch(() => {}); d.first = null; d.speed = 0; d.ctl?.abort(); if (d.path) setTimeout(() => fs.rm(d.path + '.part', { force: true }, () => {}), 500); },
+  remove: d => { if (['active', 'preparing'].includes(d.status)) act.cancel(d); dls.delete(d.id); removed.add(d.id); },
   open: d => { if (d.status === 'done') shell.openPath(d.path); }
 };
 act.retry = act.resume;
@@ -271,6 +267,21 @@ function renameDl(d, name) {
 }
 
 // ---------- local server for the browser extension ----------
+const recent = []; // time of the last captures
+function capture(j) {
+  if (!/^https?:\/\//i.test(j.url)) return { ok: false, error: 'bad link' };
+  if (!(j.v >= 2)) { // an old extension cannot tell new downloads from old ones
+    if (!capture.warned) { capture.warned = true; try { new Notification({ title: 'Download Manager', body: 'The browser extension is old. Open chrome://extensions and press reload on it.' }).show(); } catch {} }
+    logErr('capture refused (old extension): ' + j.url); return { ok: false, error: 'old extension' };
+  }
+  const now = Date.now();
+  if ([...dls.values()].some(x => x.url === j.url && now - x.added < 20000)) return { ok: true, dup: true }; // the same link just now
+  while (recent.length && now - recent[0] > 10000) recent.shift();
+  if (recent.length >= 8) { logErr('capture refused (too many at once): ' + j.url); return { ok: false, error: 'burst' }; }
+  recent.push(now);
+  add(j.url, j.headers, +j.size || 0);
+  return { ok: true };
+}
 function startServer() {
   const srv = http.createServer((req, res) => {
     const o = req.headers.origin || '';
@@ -284,13 +295,8 @@ function startServer() {
       if (!o.startsWith('chrome-extension://')) return send(403, { ok: false });
       let b = ''; req.on('data', c => { b += c; if (b.length > 65536) req.destroy(); });
       req.on('end', () => {
-        try {
-          const j = JSON.parse(b);
-          if (!/^https?:\/\//i.test(j.url)) throw 0;
-          add(j.url, j.headers, +j.size || 0).then(ok => {
-            if (!res.destroyed) send(ok ? 200 : 502, { ok: !!ok });
-          }).catch(() => { if (!res.destroyed) send(502, { ok: false }); });
-        } catch { send(400, { ok: false }); }
+        try { send(200, capture(JSON.parse(b))); }
+        catch { send(400, { ok: false }); }
       });
       return;
     }
